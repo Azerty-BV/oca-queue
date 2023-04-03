@@ -26,23 +26,40 @@ class QueueJob(models.Model):
     _inherit = "queue.job"
 
     @api.model
-    def _acquire_one_job(self):
+    def _acquire_one_job(self, channel):
         """Acquire the next job to be run.
 
         :returns: queue.job record (locked for update)
         """
-        # TODO: This method should respect channel priority and capacity,
-        #       rather than just fetching them by creation date.
-        self.env.flush_all()
-        self.env.cr.execute(
-            """
+
+        channel_query = 'AND (channel like \'{channel}.%\' OR channel = \'{channel}\')'.format(channel=channel) if channel else ''
+        self.flush()
+        query = """
             SELECT id
             FROM queue_job
-            WHERE state = 'pending'
+            WHERE state = 'pending' {}
             AND (eta IS NULL OR eta <= (now() AT TIME ZONE 'UTC'))
-            ORDER BY date_created DESC
+            ORDER BY eta, priority, date_created, id
             LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED
-            """
+            """.format(channel_query)
+
+        self.env.cr.execute(query)
+        row = self.env.cr.fetchone()
+        # _logger.info('query %s: %s', query, row)
+
+        return self.browse(row and row[0])
+
+    @api.model
+    def _lock_current_job(self, id):
+        """
+        :returns: queue.job record (locked for update)
+        """
+        self.env.cr.execute("""
+            SELECT id
+            FROM queue_job
+            WHERE id = {}
+            FOR NO KEY UPDATE SKIP LOCKED
+            """.format(id)
         )
         row = self.env.cr.fetchone()
         return self.browse(row and row[0])
@@ -55,12 +72,11 @@ class QueueJob(models.Model):
         job.set_started()
         job.store()
         _logger.debug("%s started", job.uuid)
-        # TODO: Commit the state change so that the state can be read from the UI
-        #       while the job is processing. However, doing this will release the
-        #       lock on the db, so we need to find another way.
-        # if commit:
-        #     self.flush()
-        #     self.env.cr.commit()
+
+        if commit:
+            self.flush()
+            self.env.cr.commit()
+            self._lock_current_job(self.id)
 
         # Actual processing
         try:
@@ -110,12 +126,14 @@ class QueueJob(models.Model):
         _logger.debug("%s enqueue depends done", job)
 
     @api.model
-    def _job_runner(self, commit=True):
+    def _job_runner(self, channel=None, commit=True):
         """Short-lived job runner, triggered by async crons"""
-        job = self._acquire_one_job()
+        _logger.info('start for channel %s', channel)
+        job = self._acquire_one_job(channel)
+        _logger.info('job %s', job)
         while job:
             job._process(commit=commit)
-            job = self._acquire_one_job()
+            job = self._acquire_one_job(channel)
             # TODO: If limit_time_real_cron is reached before all the jobs are done,
             #       the worker will be killed abruptly.
             #       Ideally, find a way to know if we're close to reaching this limit,
