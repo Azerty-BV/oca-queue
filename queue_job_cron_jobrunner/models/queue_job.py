@@ -33,7 +33,7 @@ class QueueJob(models.Model):
         """
 
         channel_query = 'AND (channel like \'{channel}.%\' OR channel = \'{channel}\')'.format(channel=channel) if channel else ''
-        self.flush()
+        self.env.flush_all()
         query = """
             SELECT id
             FROM queue_job
@@ -74,7 +74,7 @@ class QueueJob(models.Model):
         _logger.debug("%s started", job.uuid)
 
         if commit:
-            self.flush()
+            self.env.flush_all()
             self.env.cr.commit()
             self._lock_current_job(self.id)
 
