@@ -78,7 +78,7 @@ class BaseImportImport(models.TransientModel):
         )
         attachment.write({"res_model": "queue.job", "res_id": queue_job.id})
 
-    @api.returns("ir.attachment")
+    # @api.returns("ir.attachment")
     def _create_csv_attachment(self, fields, data, options, file_name):
         # write csv
         f = StringIO()
