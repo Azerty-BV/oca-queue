@@ -4,6 +4,10 @@
 
 import logging
 import traceback
+import threading
+import time
+from odoo.tools import config
+
 from io import StringIO
 
 from psycopg2 import OperationalError
@@ -125,14 +129,29 @@ class QueueJob(models.Model):
         while job:
             job._process(commit=commit)
             job = self._acquire_one_job(channel)
-            # TODO: If limit_time_real_cron is reached before all the jobs are done,
-            #       the worker will be killed abruptly.
-            #       Ideally, find a way to know if we're close to reaching this limit,
-            #       stop processing, and trigger a new execution to continue.
-            #
-            # if job and limit_time_real_cron_reached_or_about_to_reach:
-            #     self._cron_trigger()
-            #     break
+
+            thread = threading.current_thread()
+            thread_type = getattr(thread, 'type', None)
+            if not thread.daemon and thread_type != 'websocket' or thread_type == 'cron':
+                # We apply the limits on cron threads and HTTP requests,
+                # websocket requests excluded.
+                if getattr(thread, 'start_time', None):
+                    thread_execution_time = time.time() - thread.start_time
+                    thread_limit_time_real = config['limit_time_real']
+                    if (getattr(thread, 'type', None) == 'cron' and
+                            config['limit_time_real_cron'] and config['limit_time_real_cron'] > 0):
+                        thread_limit_time_real = config['limit_time_real_cron']
+
+                    _logger.info(
+                        'Thread %s virtual real time limit (%d/%ds) almost reached.',
+                        thread, thread_execution_time, thread_limit_time_real)
+
+                    if thread_limit_time_real and thread_execution_time - 20 > thread_limit_time_real:
+                        _logger.warning(
+                            'Thread %s virtual real time limit (%d/%ds) almost reached.',
+                            thread, thread_execution_time, thread_limit_time_real)
+                        self._cron_trigger()
+                        break
 
     @api.model
     def _cron_trigger(self, at=None):
