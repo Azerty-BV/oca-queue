@@ -121,37 +121,43 @@ class QueueJob(models.Model):
         _logger.debug("%s enqueue depends done", job)
 
     @api.model
+    def _is_almost_at_timeout(self, last_job_duration):
+        thread = threading.current_thread()
+        thread_type = getattr(thread, 'type', None)
+        if not thread.daemon and thread_type != 'websocket' or thread_type == 'cron':
+            # We apply the limits on cron threads and HTTP requests,
+            # websocket requests excluded.
+            if getattr(thread, 'start_time', None):
+                thread_execution_time = time.time() - thread.start_time
+                thread_limit_time_real = config['limit_time_real']
+                if (getattr(thread, 'type', None) == 'cron' and
+                        config['limit_time_real_cron'] and config['limit_time_real_cron'] > 0):
+                    thread_limit_time_real = config['limit_time_real_cron']
+
+                # If thread execution time + the time the last job ran (+ 2 seconds) is bigger than the time limit,
+                # it is assumed that the next job will take about the same time (with 2 second margin),
+                # the job_runner will break, before the actual timeout happens, preventing stuck "started" jobs.
+                if thread_limit_time_real and thread_execution_time + last_job_duration + 2 > thread_limit_time_real:
+                    _logger.warning(
+                        'Cronthread %s virtual real time limit (%d/%ds) almost reached, break job loop',
+                        thread, thread_execution_time, thread_limit_time_real)
+                    self._cron_trigger()
+                    return True
+        return False
+
+    @api.model
     def _job_runner(self, channel=None, commit=True):
         """Short-lived job runner, triggered by async crons"""
-        _logger.info('start for channel %s', channel)
+        _logger.info('start for channel %s', channel or 'root')
         job = self._acquire_one_job(channel)
-        _logger.info('job %s', job)
         while job:
+            job_start_time = time.time()
             job._process(commit=commit)
+            last_job_duration = time.time() - job_start_time
             job = self._acquire_one_job(channel)
 
-            thread = threading.current_thread()
-            thread_type = getattr(thread, 'type', None)
-            if not thread.daemon and thread_type != 'websocket' or thread_type == 'cron':
-                # We apply the limits on cron threads and HTTP requests,
-                # websocket requests excluded.
-                if getattr(thread, 'start_time', None):
-                    thread_execution_time = time.time() - thread.start_time
-                    thread_limit_time_real = config['limit_time_real']
-                    if (getattr(thread, 'type', None) == 'cron' and
-                            config['limit_time_real_cron'] and config['limit_time_real_cron'] > 0):
-                        thread_limit_time_real = config['limit_time_real_cron']
-
-                    _logger.info(
-                        'Thread %s virtual real time limit (%d/%ds) almost reached.',
-                        thread, thread_execution_time, thread_limit_time_real)
-
-                    if thread_limit_time_real and thread_execution_time - 20 > thread_limit_time_real:
-                        _logger.warning(
-                            'Thread %s virtual real time limit (%d/%ds) almost reached.',
-                            thread, thread_execution_time, thread_limit_time_real)
-                        self._cron_trigger()
-                        break
+            if job and self._is_almost_at_timeout(last_job_duration):
+                break
 
     @api.model
     def _cron_trigger(self, at=None):
